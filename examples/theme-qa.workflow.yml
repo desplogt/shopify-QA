@@ -28,8 +28,8 @@ jobs:
         with:
           fetch-depth: 2
 
-      # Replace with the location of the Theme QA repository.
-      - uses: sthreeone/theme-qa@v1
+      # Pinned to a release tag of Theme QA; bump it to upgrade.
+      - uses: desplogt/shopify-QA@v1
         with:
           theme-token: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
           storefront-password: ${{ secrets.STOREFRONT_PASSWORD }}
@@ -44,7 +44,7 @@ jobs:
           sparse-checkout: theme-qa.yml
           sparse-checkout-cone-mode: false
 
-      - uses: sthreeone/theme-qa@v1
+      - uses: desplogt/shopify-QA@v1
         with:
           mode: cleanup
           theme-token: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
