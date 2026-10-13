@@ -8,6 +8,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import { chromium, type Browser } from "playwright";
 import { StoreSession } from "../src/browser/session.js";
+import { runPurchaseFlow } from "../src/browser/purchase.js";
 import { runPurchaseCheck } from "../src/checks/purchase.js";
 import { runTechnicalCheck } from "../src/checks/technical.js";
 import { DEFAULT_BLOCKING_THEME_CHECKS } from "../src/compare.js";
@@ -199,4 +200,18 @@ test("Shopify's bot protection page is reported as such, never as a wrong passwo
   } finally {
     await store.close();
   }
+});
+
+test("checkout bot protection after the cart is sent is a note, not a theme failure", async () => {
+  await withStore(
+    [],
+    async ({ open }) => {
+      const artifactDir = await mkdtemp(path.join(os.tmpdir(), "theme-qa-artifacts-"));
+      const sessions = await open();
+      const outcome = await runPurchaseFlow(sessions.find((session) => session.options.side === "preview")!, { products: ["/products/shirt"], selectors: {}, artifactDir });
+      assert.equal(outcome.status, "passed", outcome.message);
+      assert.ok(outcome.notes.some((note) => /bot protection/.test(note)));
+    },
+    { challengeCheckout: true },
+  );
 });

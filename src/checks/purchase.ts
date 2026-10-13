@@ -1,6 +1,6 @@
 import { mergeViewports } from "../compare.js";
 import { PURCHASE_STEPS, runPurchaseFlow, type PurchaseOptions, type PurchaseOutcome } from "../browser/purchase.js";
-import type { StoreSession } from "../browser/session.js";
+import { BOT_CHALLENGE_HINT, type StoreSession } from "../browser/session.js";
 import type { CheckResult, FindingStatus, Observation, Severity, Viewport } from "../types.js";
 import { statusFromFindings } from "../verdict.js";
 
@@ -69,7 +69,11 @@ export async function runPurchaseCheck(input: PurchaseCheckInput): Promise<Check
     result.failure = {
       category: configError ? "config" : (errors[0]!.category ?? "internal"),
       message: errors.map((outcome) => `${outcome.side} ${outcome.viewport}: ${outcome.message}`).join("\n"),
-      hint: configError ? "List a product with stock under purchase.products in theme-qa.yml." : "Re-run the job.",
+      hint: configError
+        ? "List a product with stock under purchase.products in theme-qa.yml."
+        : errors.some((outcome) => /bot protection/.test(outcome.message ?? ""))
+          ? BOT_CHALLENGE_HINT
+          : "Re-run the job.",
     };
     return result;
   }
@@ -85,7 +89,11 @@ export async function runPurchaseCheck(input: PurchaseCheckInput): Promise<Check
   const failing = result.findings.filter((finding) => finding.severity !== "info");
   result.summary =
     failing.length === 0
-      ? `Add to cart → checkout works on ${viewports.join(" and ")}`
+      ? `Add to cart → checkout works on ${viewports.join(" and ")}${
+          outcomes.some((outcome) => outcome.notes.some((note) => /bot protection/.test(note)))
+            ? " (the cart reached checkout; Shopify's bot protection kept the checkout page itself from loading)"
+            : ""
+        }`
       : failing
           .map((finding) => `${finding.severity === "warn" ? "Also broken on live: f" : "F"}ails at step ${finding.evidence?.step} "${finding.evidence?.stepName}" (${finding.viewports.join(", ")})`)
           .join("; ");

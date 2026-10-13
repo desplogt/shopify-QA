@@ -206,14 +206,28 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
     await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
     cartDiagnosis.push(...(await diagnoseCartPage(page)));
 
+    // The theme's responsibility ends when its checkout control sends the cart to Shopify's checkout.
+    // The checkout page itself belongs to Shopify, and its bot protection may challenge automated
+    // browsers, so a challenge after the cart was sent is a note, not a theme failure.
     await step(5, async () => {
       if (!new URL(page.url()).pathname.startsWith("/cart")) await page.goto(session.url("/cart"), { waitUntil: "domcontentloaded", timeout: 30_000 });
       const checkout = visible(page.locator(options.selectors.checkout ?? '[name="checkout"], a[href*="/checkout"]'));
+      const sentToCheckout = page
+        .waitForRequest(
+          (request) => {
+            const url = new URL(request.url());
+            if (/^\/checkouts?(?:\/|$)/.test(url.pathname) || url.hostname.endsWith("checkout.shopify.com")) return true;
+            return request.method() === "POST" && url.pathname.replace(/\/+$/, "") === "/cart" && /(?:^|&)checkout(?:=|&|$)/.test(request.postData() ?? "");
+          },
+          { timeout: 15_000 },
+        )
+        .catch(() => null);
       await checkout.click({ timeout: 10_000 });
-      await page.waitForURL((url) => /\/checkouts?(?:\/|$)/.test(url.pathname) || url.hostname.endsWith("checkout.shopify.com"), {
-        timeout: 25_000,
-        waitUntil: "commit",
-      });
+      if (!(await sentToCheckout)) throw new Error("Clicking checkout did not send the cart to Shopify's checkout.");
+      await page.waitForURL((url) => /\/checkouts?(?:\/|$)/.test(url.pathname) || url.hostname.endsWith("checkout.shopify.com"), { timeout: 15_000, waitUntil: "commit" }).catch(() => undefined);
+      if (await isBotChallenge(page)) {
+        outcome.notes.push("The checkout control sent the cart to checkout; Shopify's checkout bot protection then challenged the automated browser, so the checkout page itself was not loaded.");
+      }
     });
 
     await step(6, async () => {
@@ -227,6 +241,9 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
     }
     if (!(error instanceof StepFailure)) {
       return { ...outcome, status: "error", category: "internal", message: `The purchase flow stopped unexpectedly: ${firstLine(error)}` };
+    }
+    if (await isBotChallenge(page).catch(() => false)) {
+      return { ...outcome, status: "error", category: "infra", message: `Shopify's bot protection challenged the automated browser at step ${error.step} "${PURCHASE_STEPS[error.step - 1]}".` };
     }
     outcome.status = "failed";
     outcome.failedStep = error.step;

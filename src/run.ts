@@ -143,16 +143,23 @@ export async function runGate(options: RunOptions): Promise<RunOutput> {
     log("Opening storefront sessions and verifying themes");
     browser = await (options.launchBrowser ?? (() => chromium.launch({ headless: true })))();
     const sides: Array<[ThemeSide, number]> = [["live", live.id], ["preview", theme.id]];
-    const plan = sides.flatMap(([side, themeId]) => config.viewports.map((viewport) => ({ side, themeId, viewport })));
     const base = { storeUrl: config.storeUrl, storefrontPassword: secrets.storefrontPassword, blockHosts: config.block };
-    // The storefront password is sent once; the other sessions reuse the unlocked cookies.
-    const first = await StoreSession.open(browser, { ...base, ...plan[0]! });
-    sessions.push(first);
-    const storageState = await first.context.storageState();
-    const opened = await Promise.allSettled(plan.slice(1).map((entry) => StoreSession.open(browser!, { ...base, ...entry, storageState })));
-    for (const result of opened) if (result.status === "fulfilled") sessions.push(result.value);
-    const rejected = opened.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (rejected) throw rejected.reason;
+    // Shopify keeps both the unlocked password and the previewed theme in one server-side session.
+    // Viewports of the same side share that session (the password is sent once per side), but live
+    // and preview never do, or the live storefront would render the preview theme.
+    const opened = await Promise.allSettled(
+      sides.map(async ([side, themeId]) => {
+        const [firstViewport, ...otherViewports] = config.viewports;
+        const first = await StoreSession.open(browser!, { ...base, side, themeId, viewport: firstViewport! });
+        const storageState = await first.context.storageState();
+        const others = await Promise.allSettled(otherViewports.map((viewport) => StoreSession.open(browser!, { ...base, side, themeId, viewport, storageState })));
+        const failed = others.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        return { sessions: [first, ...others.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))], failure: failed?.reason as unknown };
+      }),
+    );
+    for (const result of opened) if (result.status === "fulfilled") sessions.push(...result.value.sessions);
+    const failure = opened.flatMap((result) => (result.status === "rejected" ? [result.reason as unknown] : result.value.failure ? [result.value.failure] : []))[0];
+    if (failure) throw failure;
     await Promise.all(sessions.map((session) => session.verifyTheme()));
 
     stage = "checks";

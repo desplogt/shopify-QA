@@ -40,6 +40,8 @@ export interface FakeStoreOptions {
   rateLimitOnce?: string[];
   /** Serve Shopify's bot protection page ("Just a moment...") instead of the storefront. */
   challenge?: boolean;
+  /** Serve the bot protection page only when the cart is submitted to checkout. */
+  challengeCheckout?: boolean;
 }
 
 interface CartItem {
@@ -73,6 +75,8 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
   const carts = new Map<string, CartItem[]>();
   const rateLimited = new Set<string>();
   const stats = { passwordSubmissions: 0 };
+  const shopperSessions = new Map<string, { unlocked: boolean; previewThemeId?: number }>();
+  let nextSession = 1;
   let nextCart = 1;
   const live = themes.find((theme) => theme.role === "live")!;
 
@@ -105,25 +109,35 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
     const redirect = (location: string) => send(302, "", "text/plain", { location });
     const json = (value: unknown) => send(200, JSON.stringify(value), "application/json");
 
+    // Like Shopify, the unlocked password and the previewed theme live in a server-side session
+    // identified by one cookie (_shopify_essential): contexts that share the cookie share both.
+    let sessionId = cookies._shopify_essential;
+    if (!sessionId || !shopperSessions.has(sessionId)) {
+      sessionId = `s${nextSession++}`;
+      shopperSessions.set(sessionId, { unlocked: false });
+      setCookies.push(`_shopify_essential=${sessionId}; Path=/`);
+    }
+    const shopper = shopperSessions.get(sessionId)!;
+
     // Password page
     if (url.pathname === "/password") {
       if (request.method === "POST") {
         stats.passwordSubmissions += 1;
         const body = await readBody(request);
         if (body.get("password") === options.password) {
-          setCookies.push("storefront_digest=ok; Path=/");
+          shopper.unlocked = true;
           return redirect("/");
         }
         return send(200, passwordPage("Wrong password"));
       }
       return send(200, passwordPage());
     }
-    if (options.password && cookies.storefront_digest !== "ok") return redirect("/password");
+    if (options.password && !shopper.unlocked) return redirect("/password");
 
-    // Theme selection, like Shopify's preview session cookie
+    // Theme selection: preview_theme_id stores the preview in the shopper session.
     const requested = url.searchParams.get("preview_theme_id");
-    if (requested && !options.ignorePreview) setCookies.push(`preview_theme=${requested}; Path=/`);
-    const themeId = Number(options.ignorePreview ? live.id : (requested ?? cookies.preview_theme ?? live.id));
+    if (requested && !options.ignorePreview) shopper.previewThemeId = Number(requested);
+    const themeId = options.ignorePreview ? live.id : (shopper.previewThemeId ?? live.id);
     const theme = themes.find((candidate) => candidate.id === themeId) ?? live;
 
     // Cart session
@@ -171,6 +185,9 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
         if (cart[index]) cart[index]!.quantity = Number(value);
       });
       for (let index = cart.length - 1; index >= 0; index -= 1) if (cart[index]!.quantity <= 0) cart.splice(index, 1);
+      if (body.has("checkout") && options.challengeCheckout) {
+        return send(403, "<!DOCTYPE html><title>Just a moment...</title><p>Your connection needs to be verified before you can proceed</p>");
+      }
       return redirect(body.has("checkout") ? "/checkout" : "/cart");
     }
     if (url.pathname === "/checkout") return redirect("/checkouts/cn/test-token");

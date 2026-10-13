@@ -117,7 +117,7 @@ Runs on desktop and mobile:
 2. Open the configured product and confirm an available variant is selected (via `/products/<handle>.js`).
 3. Click "Add to cart" and confirm in `/cart.js` that the expected variant was added.
 4. Open `/cart`, set the quantity to 2, and confirm it in `/cart.js`.
-5. Click "Checkout" and confirm Shopify's checkout loads. The flow stops there; no order is placed.
+5. Click "Checkout" and confirm the theme sends the cart to Shopify's checkout. The flow stops there; no order is placed. The checkout page belongs to Shopify, not the theme: if Shopify's checkout bot protection challenges the automated browser after the cart was sent, it is reported as a note, not a failure.
 6. Clear the cart.
 
 The same flow runs on the live theme as a control:
@@ -267,7 +267,9 @@ Real-store behavior that the first local version did not handle, now covered by 
 - `/cart/clear.js` returns JSON labelled `text/javascript`; cart responses are parsed by body.
 - `?preview_theme_id=` redirects to the same path and keeps the preview in a cookie.
 - Shopify's preview bar is fixed to the bottom of the page; it is hidden so it cannot cover buttons or appear in screenshots.
-- Rate limits and the bot protection page (see section 8).
+- Rate limits and the bot protection page (see section 8). Shopify's checkout is protected by Cloudflare ("Verify you are human"); the purchase flow therefore verifies the theme's hand-off to checkout rather than the checkout page itself.
+- Shopify keeps the unlocked storefront password and the previewed theme in the same server-side session (`_shopify_essential`). Sessions of the same theme share it, so the password is sent once per side; live and preview never share it, or live would render the preview theme. Theme verification caught this during testing.
+- Development stores cannot remove their storefront password, so every run must submit it, and the password form is where bot protection is strictest. Test stores are therefore harsher than public client stores: space out runs, and expect occasional "bot protection" infra results there.
 
 ## 12. To validate on the test store
 

@@ -103,11 +103,13 @@ test("a new Theme Check syntax error in a changed file blocks; untouched files a
   });
 });
 
-test("the storefront password is submitted once per run, not once per session", async () => {
+test("the password is submitted once per theme side, and live never inherits the preview", async () => {
   await withStore([], async (url, stats) => {
     const cwd = await themeRepo(url, "section");
-    await run(cwd, fakeShopify([]));
-    assert.equal(stats.passwordSubmissions, 1);
+    await writeFile(path.join(cwd, "theme-qa.yml"), [`store: ${url}`, "pages: ['/']", "purchase:", "  products: ['/products/shirt']", "viewports: [desktop, mobile]"].join("\n"));
+    const { report } = await run(cwd, fakeShopify([]));
+    assert.equal(report.stageFailure, undefined, report.stageFailure?.message);
+    assert.equal(stats.passwordSubmissions, 2, "one submission for live, one for preview");
   });
 });
 
