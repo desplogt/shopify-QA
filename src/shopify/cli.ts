@@ -142,11 +142,12 @@ export class ShopifyCli {
   }
 }
 
-function parseJson(stdout: string, label: string): unknown {
-  // The CLI may print warnings before the JSON payload.
+/** Extracts the JSON payload; the CLI may print warnings before it and upgrade notices after it. */
+export function parseJson(stdout: string, label: string): unknown {
   const start = stdout.search(/[[{]/);
+  const end = Math.max(stdout.lastIndexOf("]"), stdout.lastIndexOf("}"));
   try {
-    return JSON.parse(stdout.slice(Math.max(start, 0)));
+    return JSON.parse(stdout.slice(Math.max(start, 0), end + 1));
   } catch {
     throw new StageError("theme", "infra", `Unexpected output from Shopify CLI (${label}).\n${tail(stdout, 5)}`, "Re-run the job.");
   }

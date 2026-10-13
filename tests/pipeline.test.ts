@@ -76,10 +76,10 @@ async function run(cwd: string, runner: CommandRunner, env: NodeJS.ProcessEnv = 
   return { ...output, json, markdownFile: markdown };
 }
 
-async function withStore<T>(previewFaults: Fault[], action: (url: string) => Promise<T>): Promise<T> {
+async function withStore<T>(previewFaults: Fault[], action: (url: string, stats: { passwordSubmissions: number }) => Promise<T>): Promise<T> {
   const store = await startFakeStore([fakeTheme("live"), fakeTheme("unpublished", previewFaults)], { password: STOREFRONT_PASSWORD, secret: STOREFRONT_PASSWORD });
   try {
-    return await action(store.url);
+    return await action(store.url, store.stats);
   } finally {
     await store.close();
   }
@@ -100,6 +100,14 @@ test("a new Theme Check syntax error in a changed file blocks; untouched files a
     assert.equal(report.checks.find((check) => check.id === "purchase")?.status, "pass");
     assert.match(markdown, /Theme Check · LiquidHTMLSyntaxError/);
     assert.ok(calls.some((args) => args.includes("--unpublished")));
+  });
+});
+
+test("the storefront password is submitted once per run, not once per session", async () => {
+  await withStore([], async (url, stats) => {
+    const cwd = await themeRepo(url, "section");
+    await run(cwd, fakeShopify([]));
+    assert.equal(stats.passwordSubmissions, 1);
   });
 });
 

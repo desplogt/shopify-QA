@@ -47,6 +47,8 @@ export function isNoise(observation: Observation): boolean {
       const status = Number(observation.evidence?.status);
       return [401, 403, 429].includes(status) || isAnalyticsEndpoint(observation.resource);
     }
+    case "broken-link":
+      return Number(observation.evidence?.status) === 429;
     default:
       return false;
   }

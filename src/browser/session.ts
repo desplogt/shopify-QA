@@ -9,12 +9,16 @@ import type { ThemeSide, Viewport } from "../types.js";
  */
 const NAME_SHIM = "globalThis.__name = globalThis.__name || ((target) => target);";
 
-const IPHONE_USER_AGENT =
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+/** Shopify's preview bar is fixed to the bottom of the page: it can cover buttons and pollutes screenshots. */
+const HIDE_PREVIEW_BAR = `document.addEventListener("DOMContentLoaded", () => {
+  const style = document.createElement("style");
+  style.textContent = "#preview-bar-iframe, #PBarNextFrameWrapper, #PBarNextFrame { display: none !important; }";
+  document.head.appendChild(style);
+});`;
 
 const VIEWPORT_SETTINGS = {
   desktop: { viewport: { width: 1440, height: 900 }, isMobile: false, hasTouch: false },
-  mobile: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, userAgent: IPHONE_USER_AGENT },
+  mobile: { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
 } as const;
 
 export interface SessionOptions {
@@ -26,6 +30,21 @@ export interface SessionOptions {
   storefrontPassword?: string;
   /** Substrings of hostnames whose requests are aborted (analytics, chat widgets, popups). */
   blockHosts: readonly string[];
+  /** Cookies from a session that already unlocked the storefront, so the password is sent once per run. */
+  storageState?: Awaited<ReturnType<BrowserContext["storageState"]>>;
+}
+
+export const BOT_CHALLENGE_HINT =
+  "Wait 30–60 minutes and re-run. If it keeps happening, run Theme QA from a self-hosted runner (a non-datacenter IP) or check fewer pages and viewports.";
+
+/** Shopify's bot protection page ("Just a moment… Your connection needs to be verified"). */
+export async function isBotChallenge(page: Page): Promise<boolean> {
+  if (/just a moment/i.test(await page.title().catch(() => ""))) return true;
+  return (await page.getByText(/connection needs to be verified/i).count().catch(() => 0)) > 0;
+}
+
+function botChallengeError(label: string): StageError {
+  return new StageError("verify", "infra", `Shopify's bot protection challenged the automated browser (${label}): "Your connection needs to be verified".`, BOT_CHALLENGE_HINT);
 }
 
 export async function isPasswordPage(page: Page): Promise<boolean> {
@@ -49,8 +68,18 @@ export class StoreSession {
   ) {}
 
   static async open(browser: Browser, options: SessionOptions): Promise<StoreSession> {
-    const context = await browser.newContext({ ...VIEWPORT_SETTINGS[options.viewport], reducedMotion: "reduce" });
+    // Headless Chromium announces itself as "HeadlessChrome", and a Safari user agent on a Chromium
+    // engine contradicts its client hints. Bot protection throttles both, so the user agent is
+    // a regular Chrome (desktop) or Chrome on Android (mobile) of the same version.
+    const chrome = `Chrome/${browser.version().split(".")[0]}.0.0.0`;
+    const userAgent =
+      options.viewport === "desktop"
+        ? `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ${chrome} Safari/537.36`
+        : `Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) ${chrome} Mobile Safari/537.36`;
+    const settings = { ...VIEWPORT_SETTINGS[options.viewport], userAgent };
+    const context = await browser.newContext({ ...settings, reducedMotion: "reduce", storageState: options.storageState });
     await context.addInitScript({ content: NAME_SHIM });
+    await context.addInitScript({ content: HIDE_PREVIEW_BAR });
     if (options.blockHosts.length > 0) {
       await context.route("**/*", (route) => {
         const host = new URL(route.request().url()).hostname;
@@ -84,6 +113,7 @@ export class StoreSession {
       await page.goto(this.url("/"), { waitUntil: "domcontentloaded", timeout: 30_000 }).catch((error: unknown) => {
         throw new StageError("verify", "infra", `The storefront did not respond (${this.label}): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`, "Re-run the job.");
       });
+      if (await isBotChallenge(page)) throw botChallengeError(this.label);
       if (!(await isPasswordPage(page))) return;
       const password = this.options.storefrontPassword;
       if (!password) {
@@ -92,6 +122,7 @@ export class StoreSession {
       const input = page.locator('form[action*="/password"] input[type="password"]').first();
       await input.fill(password);
       await Promise.all([page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => null), input.press("Enter")]);
+      if (await isBotChallenge(page)) throw botChallengeError(this.label);
       if (await isPasswordPage(page)) {
         throw new StageError("verify", "config", "The storefront password was rejected.", "Update the STOREFRONT_PASSWORD secret.");
       }
@@ -106,6 +137,7 @@ export class StoreSession {
     try {
       await page.goto(this.url("/"), { waitUntil: "domcontentloaded", timeout: 30_000 });
       const rendered = await renderedThemeId(page);
+      if (rendered === null && (await isBotChallenge(page))) throw botChallengeError(this.label);
       if (rendered !== this.options.themeId) {
         throw new StageError(
           "verify",

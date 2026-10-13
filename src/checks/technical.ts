@@ -1,7 +1,7 @@
 import { buildFindings } from "../compare.js";
 import type { IgnoreRule } from "../noise.js";
 import { brokenLinkObservations, checkLinks, scanPage, type PageScan } from "../browser/scan.js";
-import type { StoreSession } from "../browser/session.js";
+import { BOT_CHALLENGE_HINT, type StoreSession } from "../browser/session.js";
 import type { CheckFailure, CheckResult, Finding, Observation } from "../types.js";
 import { statusFromFindings } from "../verdict.js";
 
@@ -19,9 +19,17 @@ export interface TechnicalCheckInput {
   themeCheck?: ThemeCheckDiffResult | { failure: CheckFailure };
 }
 
+/**
+ * A page that did not load, answered 429, or has no Shopify theme object was most likely
+ * throttled by Shopify; wait and load it again before drawing any conclusion.
+ */
 async function scanWithRetry(session: StoreSession, path: string): Promise<PageScan> {
-  const first = await scanPage(session, path);
-  return first.loadError ? scanPage(session, path) : first;
+  let scan = await scanPage(session, path);
+  for (let attempt = 1; attempt < 3 && (scan.loadError || scan.status === 429 || scan.themeId === null); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3_000 * attempt));
+    scan = await scanPage(session, path);
+  }
+  return scan;
 }
 
 function summarize(findings: readonly Finding[]): string {
@@ -38,15 +46,20 @@ function summarize(findings: readonly Finding[]): string {
 
 export async function runTechnicalCheck(input: TechnicalCheckInput): Promise<CheckResult> {
   const result: CheckResult = { id: "technical", title: "Technical errors", mandatory: true, status: "pass", summary: "", findings: [] };
-  const scans = (
-    await Promise.all(
-      input.sessions.map(async (session) => {
+  // Live and preview are scanned together per viewport; viewports run one after another to
+  // avoid the request bursts that make Shopify throttle the sessions.
+  const scans: PageScan[] = [];
+  for (const viewport of [...new Set(input.sessions.map((session) => session.options.viewport))]) {
+    const group = input.sessions.filter((session) => session.options.viewport === viewport);
+    const groupScans = await Promise.all(
+      group.map(async (session) => {
         const sessionScans: PageScan[] = [];
         for (const path of input.pages) sessionScans.push(await scanWithRetry(session, path));
         return sessionScans;
       }),
-    )
-  ).flat();
+    );
+    scans.push(...groupScans.flat());
+  }
 
   const failures: string[] = [];
   const live: Observation[] = [];
@@ -65,7 +78,12 @@ export async function runTechnicalCheck(input: TechnicalCheckInput): Promise<Che
       continue;
     }
     if (scan.themeId !== session.options.themeId) {
-      failures.push(`${scan.path} (${scan.side}, ${scan.viewport}) rendered theme ${scan.themeId ?? "unknown"} instead of ${session.options.themeId}.`);
+      const reason = scan.challenged
+        ? "Shopify's bot protection challenge page"
+        : scan.themeId === null
+          ? `a page without a Shopify theme (HTTP ${scan.status ?? "?"}${scan.status === 429 ? ", Shopify rate limit" : ""})`
+          : `theme ${scan.themeId}`;
+      failures.push(`${scan.path} (${scan.side}, ${scan.viewport}) rendered ${reason} instead of theme ${session.options.themeId}.`);
       continue;
     }
     if (scan.side === "live" && scan.status === 404) {
@@ -83,7 +101,12 @@ export async function runTechnicalCheck(input: TechnicalCheckInput): Promise<Che
   ];
   if (failures.length > 0) {
     result.status = "error";
-    result.failure = { category: "infra", message: failures.join("\n"), hint: "Re-run the job. If a page is gone from the store, update theme-qa.yml." };
+    const challenged = scans.some((scan) => scan.challenged);
+    result.failure = {
+      category: "infra",
+      message: failures.join("\n"),
+      hint: challenged ? BOT_CHALLENGE_HINT : "Re-run the job. If a page is gone from the store, update theme-qa.yml.",
+    };
     result.summary = "Could not be verified";
     return result;
   }

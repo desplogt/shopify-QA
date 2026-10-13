@@ -164,3 +164,39 @@ test("a preview that serves the live theme is caught before any check runs", asy
     { ignorePreview: true },
   );
 });
+
+test("Dawn-style pages: the installment form without a button is skipped", async () => {
+  // The fake store renders a Shop Pay installments form before the real product form, like Dawn.
+  await withStore([], async ({ open }) => {
+    const artifactDir = await mkdtemp(path.join(os.tmpdir(), "theme-qa-artifacts-"));
+    const result = await runPurchaseCheck({ sessions: await open(), products: ["/products/shirt"], selectors: {}, artifactDir });
+    assert.equal(result.status, "pass", result.summary);
+  });
+});
+
+test("Shopify rate limits (429) on the cart API and links are waited out, not reported", async () => {
+  await withStore(
+    [],
+    async ({ open }) => {
+      const sessions = await open();
+      const artifactDir = await mkdtemp(path.join(os.tmpdir(), "theme-qa-artifacts-"));
+      const purchase = await runPurchaseCheck({ sessions, products: ["/products/shirt"], selectors: {}, artifactDir });
+      assert.equal(purchase.status, "pass", purchase.summary);
+      const result = await technical(sessions);
+      assert.ok(!result.findings.some((finding) => finding.rule === "broken-link"), JSON.stringify(result.findings, null, 2));
+    },
+    { rateLimitOnce: ["/cart.js", "/pages/about"] },
+  );
+});
+
+test("Shopify's bot protection page is reported as such, never as a wrong password", async () => {
+  const store = await startFakeStore([fakeTheme("live"), fakeTheme("unpublished")], { password: "letmein", challenge: true });
+  try {
+    await assert.rejects(
+      StoreSession.open(browser, { storeUrl: store.url, side: "live", viewport: "desktop", themeId: 1001, storefrontPassword: "letmein", blockHosts: [] }),
+      (error: unknown) => error instanceof StageError && error.category === "infra" && /bot protection/.test(error.message) && /Wait 30/.test(error.hint ?? ""),
+    );
+  } finally {
+    await store.close();
+  }
+});

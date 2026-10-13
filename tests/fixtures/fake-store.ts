@@ -36,6 +36,10 @@ export interface FakeStoreOptions {
   ignorePreview?: boolean;
   /** Value logged by the "leak-secret" fault, to prove reports redact it. */
   secret?: string;
+  /** The first request to each of these paths gets Shopify's HTML "429 Too Many Requests" page. */
+  rateLimitOnce?: string[];
+  /** Serve Shopify's bot protection page ("Just a moment...") instead of the storefront. */
+  challenge?: boolean;
 }
 
 interface CartItem {
@@ -67,6 +71,8 @@ async function readBody(request: IncomingMessage): Promise<URLSearchParams> {
 
 export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOptions = {}) {
   const carts = new Map<string, CartItem[]>();
+  const rateLimited = new Set<string>();
+  const stats = { passwordSubmissions: 0 };
   let nextCart = 1;
   const live = themes.find((theme) => theme.role === "live")!;
 
@@ -80,6 +86,17 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
     const url = new URL(request.url ?? "/", "http://store.test");
+    if (options.rateLimitOnce?.includes(url.pathname) && !rateLimited.has(url.pathname)) {
+      rateLimited.add(url.pathname);
+      response.writeHead(429, { "content-type": "text/html", "retry-after": "1" }).end("<!DOCTYPE html><title>Too Many Requests</title>");
+      return;
+    }
+    if (options.challenge && !url.pathname.startsWith("/cdn/")) {
+      response
+        .writeHead(403, { "content-type": "text/html" })
+        .end("<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><p>Your connection needs to be verified before you can proceed</p></body></html>");
+      return;
+    }
     const cookies = parseCookies(request);
     const setCookies: string[] = [];
     const send = (status: number, body: string | Buffer, type = "text/html; charset=utf-8", headers: Record<string, string> = {}) => {
@@ -91,6 +108,7 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
     // Password page
     if (url.pathname === "/password") {
       if (request.method === "POST") {
+        stats.passwordSubmissions += 1;
         const body = await readBody(request);
         if (body.get("password") === options.password) {
           setCookies.push("storefront_digest=ok; Path=/");
@@ -137,7 +155,8 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
     if (url.pathname === "/cart.js") return json(cartJson());
     if (url.pathname === "/cart/clear.js" && request.method === "POST") {
       cart.length = 0;
-      return json(cartJson());
+      // Real Shopify answers this endpoint with JSON labelled as text/javascript.
+      return send(200, JSON.stringify(cartJson()), "text/javascript; charset=utf-8");
     }
     if ((url.pathname === "/cart/add.js" || url.pathname === "/cart/add") && request.method === "POST") {
       const body = await readBody(request);
@@ -185,7 +204,7 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
         const broken = theme.faults.has("broken-add-to-cart");
         return send(
           200,
-          `document.querySelectorAll('form[action="/cart/add"]').forEach((form) => {
+          `document.querySelectorAll('form.product-form').forEach((form) => {
             form.addEventListener('submit', async (event) => {
               event.preventDefault();
               ${broken ? "form.querySelector('.does-not-exist').dataset.loading = 'true';" : ""}
@@ -217,6 +236,8 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
 <body>
   <div id="shopify-section-sections--${theme.templateId}__header" class="shopify-section">
     <header><a href="/">Home</a> <a href="/collections/all">Shop</a> <a href="/cart">Cart</a> <span id="cart-count"></span></header>
+    <!-- Like Dawn: a hidden cart drawer with its own checkout button, earlier in the DOM than the cart page's. -->
+    <div id="CartDrawer" style="display:none"><form id="CartDrawer-Form" action="/cart" method="post"><input type="number" name="updates[]" value="1"></form><button type="submit" name="checkout" form="CartDrawer-Form">Check out</button></div>
   </div>
   <main>
     <div id="shopify-section-template--${theme.templateId}__${mainSection}" class="shopify-section">${content}</div>
@@ -249,8 +270,9 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
           `<h1>${product.title}</h1>
           <img src="/cdn/shop/files/hero.png" alt="${product.title}" width="200" height="200">
           <span class="price">$20.00</span>
+          <form action="/cart/add" method="post" class="installment"><input type="hidden" name="id" value="${selected.id}"></form>
           ${liquidError}
-          <form action="/cart/add" method="post">
+          <form action="/cart/add" method="post" class="product-form">
             ${theme.faults.has("no-variant-id") ? "" : `<input type="hidden" name="id" value="${selected.id}">`}
             <input type="number" name="quantity" value="1">
             <button type="submit" name="add" ${selected.available ? "" : "disabled"}>${selected.available ? "Add to cart" : "Sold out"}</button>
@@ -273,6 +295,7 @@ export async function startFakeStore(themes: FakeTheme[], options: FakeStoreOpti
   const { port } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${port}`,
+    stats,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

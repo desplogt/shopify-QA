@@ -87,6 +87,7 @@ test("known infrastructure noise never appears as a new finding", () => {
     { rule: "request-failed", message: "POST request failed", page: "/", resource: "https://example.myshopify.com/api/collect", evidence: { failure: "net::ERR_ABORTED" } },
     { rule: "resource-error", message: "HTTP 429 response", page: "/", resource: "https://reviews.example/api", evidence: { status: 429 } },
     { rule: "resource-error", message: "HTTP 500 response", page: "/", resource: "https://monorail-edge.shopifysvc.com/v1/produce", evidence: { status: 500 } },
+    { rule: "broken-link", message: "Link returns HTTP 429", page: "/", resource: "https://example.myshopify.com/pages/about", evidence: { status: 429 } },
   ];
   assert.deepEqual(buildFindings([], preview), []);
 });

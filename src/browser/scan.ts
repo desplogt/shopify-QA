@@ -1,7 +1,7 @@
 import type { APIRequestContext } from "playwright";
 import { normalizeUrl, sectionKey } from "../normalize.js";
 import type { Observation, ThemeSide, Viewport } from "../types.js";
-import { renderedThemeId, type StoreSession } from "./session.js";
+import { isBotChallenge, renderedThemeId, type StoreSession } from "./session.js";
 
 const THEME_ASSET_PATH = /\/t\/\d+\/(?:compiled_)?assets\//;
 const STACK_URL = /https?:\/\/[^\s)]+/;
@@ -14,6 +14,8 @@ export interface PageScan {
   status: number | null;
   loadError?: string;
   themeId: number | null;
+  /** Shopify's bot protection served its challenge page instead of the storefront. */
+  challenged?: boolean;
   observations: Observation[];
   /** Same-origin links found on the page, without fragments. */
   links: string[];
@@ -173,7 +175,8 @@ export async function scanPage(session: StoreSession, path: string): Promise<Pag
       ].slice(0, 60),
     );
 
-    return { path, side, viewport, status, themeId: await renderedThemeId(page), observations, links };
+    const themeId = await renderedThemeId(page);
+    return { path, side, viewport, status, themeId, challenged: themeId === null && (await isBotChallenge(page)), observations, links };
   } finally {
     await page.close();
   }
@@ -184,23 +187,36 @@ export interface LinkResult {
   error?: string;
 }
 
-/** Checks each unique link once per run, independent of the theme that linked to it. */
-export async function checkLinks(request: APIRequestContext, links: Iterable<string>, concurrency = 6): Promise<Map<string, LinkResult>> {
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Checks each unique link once per run, independent of the theme that linked to it. Shopify
+ * rate-limits bursts (HTTP 429), so requests are paced and 429s are retried, never reported.
+ */
+export async function checkLinks(request: APIRequestContext, links: Iterable<string>, concurrency = 2): Promise<Map<string, LinkResult>> {
   const unique = [...new Set([...links].map((link) => normalizeUrl(link)))];
   const results = new Map<string, LinkResult>();
   let index = 0;
+  const fetchStatus = async (link: string): Promise<number> => {
+    for (let attempt = 1; ; attempt += 1) {
+      let response = await request.head(link, { maxRedirects: 5, timeout: 10_000, failOnStatusCode: false });
+      if ([403, 405, 501].includes(response.status())) {
+        response = await request.get(link, { maxRedirects: 5, timeout: 10_000, failOnStatusCode: false });
+      }
+      if (response.status() !== 429 || attempt >= 3) return response.status();
+      const retryAfter = Number(response.headers()["retry-after"]);
+      await sleep(Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : 2_000 * attempt, 5_000));
+    }
+  };
   const worker = async () => {
     while (index < unique.length) {
       const link = unique[index++]!;
       try {
-        let response = await request.head(link, { maxRedirects: 5, timeout: 10_000, failOnStatusCode: false });
-        if ([403, 405, 501].includes(response.status())) {
-          response = await request.get(link, { maxRedirects: 5, timeout: 10_000, failOnStatusCode: false });
-        }
-        results.set(link, { status: response.status() });
+        results.set(link, { status: await fetchStatus(link) });
       } catch (error) {
         results.set(link, { error: error instanceof Error ? error.message.split("\n")[0] : String(error) });
       }
+      await sleep(150);
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, worker));
@@ -211,7 +227,8 @@ export function brokenLinkObservations(scan: PageScan, results: ReadonlyMap<stri
   return scan.links.flatMap((link) => {
     const resource = normalizeUrl(link);
     const result = results.get(resource);
-    if (!result || (result.status !== undefined && result.status < 400)) return [];
+    // 429 means Shopify throttled the checker; the link itself is unverified, not broken.
+    if (!result || (result.status !== undefined && (result.status < 400 || result.status === 429))) return [];
     return [
       {
         page: scan.path,

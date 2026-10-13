@@ -46,7 +46,7 @@ Pull request closed → delete the QA theme
 | 1. Prepare | Validates `theme-qa.yml`, required secrets, and that the store responds | ❌ **config** — names the missing field or secret. Nothing is uploaded |
 | 2. Build | Runs the configured `build` command | ❌ **theme** — shows the tail of the build log |
 | 3. QA theme | If the store is at its theme limit, first deletes `theme-qa PR #N` themes whose pull request is closed. Then pushes the code | Liquid rejected by Shopify → ❌ **theme** with file and message. Invalid token → ❌ **config** ("regenerate the Theme Access password"). Shopify unavailable → 3 retries with exponential backoff, then ❌ **infra** |
-| 4. Verify | Unlocks a password-protected storefront, then checks that `window.Shopify.theme.id` on the preview equals the QA theme ID | Mismatch → ❌ **infra**, run stops (prevents approving live-vs-live). Wrong storefront password → ❌ **config** |
+| 4. Verify | Unlocks a password-protected storefront once (other sessions reuse the cookie), then checks that `window.Shopify.theme.id` on the preview equals the QA theme ID | Mismatch → ❌ **infra**, run stops (prevents approving live-vs-live). Wrong storefront password → ❌ **config**. Shopify's bot protection page ("Your connection needs to be verified") → ❌ **infra** with a wait-and-retry hint, never reported as a wrong password |
 | 5. Checks | See section 4 | Each check reports independently |
 | 6–7. Verdict & report | Computes the outcome, updates a single sticky PR comment, publishes artifacts and the job status | If the comment cannot be posted, the job status still reflects the outcome |
 | Cleanup | Deletes the QA theme when the PR closes | If deletion fails, stage 3 cleans it up on a later run |
@@ -233,6 +233,8 @@ Target duration for a typical run: **4–6 minutes** (about $0.03). Rules that k
 
 If an organization without a payment method exhausts its included minutes, the check cannot run and merges stay blocked (fail closed). Mitigate with a payment method plus a spending budget, or a self-hosted runner.
 
+**Shopify rate limits and bot protection.** Shopify throttles bursts of storefront requests (HTTP 429) and its bot protection can challenge automated browsers, especially after many runs in a short time or from datacenter IPs. Theme QA keeps its footprint small: the storefront password is sent once per run, live and preview run together per viewport while viewports run sequentially, link checks are paced, user agents are regular Chrome, and 429 responses are waited out using `Retry-After`. Throttled observations are never reported as theme defects. If CI runs are challenged regularly, use a self-hosted runner.
+
 ## 9. Roadmap
 
 | Phase | Scope |
@@ -256,12 +258,23 @@ These are encoded as automated tests and must always pass:
 - Known infrastructure noise never appears as a new finding.
 - Secrets never appear in any report.
 
-## 11. To validate on the test store
+## 11. Findings from the test store
+
+Real-store behavior that the first local version did not handle, now covered by regression tests:
+
+- Dawn renders a Shop Pay installments form posting to `/cart/add` before the product form; the product form is the one with an add-to-cart control.
+- Dawn's cart drawer keeps hidden copies of the checkout button and quantity inputs; only visible controls are used.
+- `/cart/clear.js` returns JSON labelled `text/javascript`; cart responses are parsed by body.
+- `?preview_theme_id=` redirects to the same path and keeps the preview in a cookie.
+- Shopify's preview bar is fixed to the bottom of the page; it is hidden so it cannot cover buttons or appear in screenshots.
+- Rate limits and the bot protection page (see section 8).
+
+## 12. To validate on the test store
 
 - Exact Shopify CLI output when a push is rejected (Liquid errors), to parse file and message reliably.
 - `shopify theme push --development-context <PR>` (CLI 3.94+): development themes may avoid the theme limit and expire automatically. Adopt it if preview links work for them.
 - Real durations per stage, to confirm the 4–6 minute target.
 
-## 12. Prior art
+## 13. Prior art
 
 The comparison approach was informed by a review of [Giedrius-Lau/shopify-qa-agent](https://github.com/Giedrius-Lau/shopify-qa-agent): multiset comparison against live, normalization of Shopify-generated identifiers, infrastructure-noise filtering, structural section fingerprints, file-to-section attribution, and accuracy regression tests. That repository has no license, so **no code was copied**; only the ideas were reimplemented. Gaps addressed here: verifying that the preview serves the expected theme, normalizing theme-numbered asset paths, retrying flaky steps, failing closed, and exercising the real purchase flow instead of only inspecting the DOM.

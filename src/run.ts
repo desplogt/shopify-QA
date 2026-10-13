@@ -143,13 +143,13 @@ export async function runGate(options: RunOptions): Promise<RunOutput> {
     log("Opening storefront sessions and verifying themes");
     browser = await (options.launchBrowser ?? (() => chromium.launch({ headless: true })))();
     const sides: Array<[ThemeSide, number]> = [["live", live.id], ["preview", theme.id]];
-    const opened = await Promise.allSettled(
-      sides.flatMap(([side, themeId]) =>
-        config.viewports.map((viewport) =>
-          StoreSession.open(browser!, { storeUrl: config.storeUrl, side, viewport, themeId, storefrontPassword: secrets.storefrontPassword, blockHosts: config.block }),
-        ),
-      ),
-    );
+    const plan = sides.flatMap(([side, themeId]) => config.viewports.map((viewport) => ({ side, themeId, viewport })));
+    const base = { storeUrl: config.storeUrl, storefrontPassword: secrets.storefrontPassword, blockHosts: config.block };
+    // The storefront password is sent once; the other sessions reuse the unlocked cookies.
+    const first = await StoreSession.open(browser, { ...base, ...plan[0]! });
+    sessions.push(first);
+    const storageState = await first.context.storageState();
+    const opened = await Promise.allSettled(plan.slice(1).map((entry) => StoreSession.open(browser!, { ...base, ...entry, storageState })));
     for (const result of opened) if (result.status === "fulfilled") sessions.push(result.value);
     const rejected = opened.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (rejected) throw rejected.reason;
@@ -157,12 +157,16 @@ export async function runGate(options: RunOptions): Promise<RunOutput> {
 
     stage = "checks";
     const themeCheck = config.themeCheck.enabled && options.base && changed ? await themeCheckDiff(cli, options.cwd, config, options.base, changed, runner) : undefined;
-    log("Checking technical errors");
-    checks.push(await runTechnicalCheck({ sessions, pages: config.pages, ignore: config.ignore, blockingThemeChecks: config.themeCheck.blocking, themeCheck }));
+    // The purchase flow runs first: it matters most and must not inherit throttling from link checks.
     log("Running the purchase flow");
-    checks.push(
-      await runPurchaseCheck({ sessions, products: config.purchase.products, selectors: config.purchase.selectors, artifactDir: path.resolve(options.cwd, options.reportDir, "artifacts") }),
-    );
+    const purchase = await runPurchaseCheck({
+      sessions,
+      products: config.purchase.products,
+      selectors: config.purchase.selectors,
+      artifactDir: path.resolve(options.cwd, options.reportDir, "artifacts"),
+    });
+    log("Checking technical errors");
+    checks.push(await runTechnicalCheck({ sessions, pages: config.pages, ignore: config.ignore, blockingThemeChecks: config.themeCheck.blocking, themeCheck }), purchase);
   } catch (error) {
     stageFailure = toStageFailure(error, stage);
   } finally {

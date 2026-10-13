@@ -52,8 +52,14 @@ export interface PurchaseCheckInput extends PurchaseOptions {
 
 export async function runPurchaseCheck(input: PurchaseCheckInput): Promise<CheckResult> {
   const result: CheckResult = { id: "purchase", title: "Purchase flow", mandatory: true, status: "pass", summary: "", findings: [] };
-  const outcomes = await Promise.all(input.sessions.map((session) => runPurchaseFlow(session, input)));
-  const viewports = [...new Set(outcomes.map((outcome) => outcome.viewport))] as Viewport[];
+  // Live and preview run together per viewport; viewports run one after another to avoid the
+  // request bursts that make Shopify answer 429.
+  const viewports = [...new Set(input.sessions.map((session) => session.options.viewport))] as Viewport[];
+  const outcomes: PurchaseOutcome[] = [];
+  for (const viewport of viewports) {
+    const sessions = input.sessions.filter((session) => session.options.viewport === viewport);
+    outcomes.push(...(await Promise.all(sessions.map((session) => runPurchaseFlow(session, input)))));
+  }
 
   const errors = outcomes.filter((outcome) => outcome.status === "error");
   if (errors.length > 0) {

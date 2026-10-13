@@ -3,7 +3,7 @@ import path from "node:path";
 import type { Locator, Page } from "playwright";
 import type { ErrorCategory, ThemeSide, Viewport } from "../types.js";
 import { diagnoseCartPage, diagnoseProductPage } from "./diagnose.js";
-import type { StoreSession } from "./session.js";
+import { isBotChallenge, type StoreSession } from "./session.js";
 
 export const PURCHASE_STEPS = [
   "Clear the cart",
@@ -57,6 +57,14 @@ class StepFailure extends Error {
   }
 }
 
+/** Shopify throttled the session or returned something other than the cart API. */
+class InfraError extends Error {}
+
+const ADD_CONTROL = '[name="add"], button[type="submit"], input[type="submit"]';
+
+/** Themes keep hidden copies of controls (Dawn's cart drawer has its own checkout button). */
+const visible = (locator: Locator) => locator.filter({ visible: true }).first();
+
 const firstLine = (error: unknown) => (error instanceof Error ? error.message.split("\n")[0] ?? error.message : String(error));
 
 export interface PurchaseOptions {
@@ -73,9 +81,45 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
   const productDiagnosis: string[] = [];
   const cartDiagnosis: string[] = [];
 
-  const readCart = async (): Promise<CartState> => (await context.request.get(`${storeUrl}/cart.js`, { failOnStatusCode: false })).json() as Promise<CartState>;
+  /**
+   * Calls the cart API from inside the page with fetch(), exactly like theme JavaScript does
+   * (same origin, browser headers, cookies). Shopify throttles bursts with HTTP 429, so it
+   * honours Retry-After and only gives up after about half a minute.
+   */
+  const cartApi = async (method: "GET" | "POST", path: string): Promise<CartState> => {
+    let last = "no response";
+    for (let attempt = 1; attempt <= 6; attempt += 1) {
+      if (!page.url().startsWith(new URL(storeUrl).origin)) await page.goto(session.url("/cart"), { waitUntil: "domcontentloaded", timeout: 30_000 });
+      const result = await page
+        .evaluate(
+          async ({ method, path }) => {
+            const response = await fetch(path, { method, headers: { accept: "application/json" }, credentials: "same-origin" });
+            // Shopify serves some cart endpoints as text/javascript, so parse the body, not the header.
+            const text = await response.text();
+            let json: unknown = null;
+            if (response.ok) {
+              try {
+                json = JSON.parse(text);
+              } catch {
+                json = null;
+              }
+            }
+            return { status: response.status, json, retryAfter: response.headers.get("retry-after"), detail: response.headers.get("content-type") ?? "" };
+          },
+          { method, path },
+        )
+        // A navigation started by the theme interrupts the call; try again on the next page.
+        .catch((error: unknown) => ({ status: 0, json: null, retryAfter: null, detail: firstLine(error) }));
+      if (result.json) return result.json as CartState;
+      last = result.status === 429 ? "HTTP 429 (Shopify rate limit)" : result.status === 0 ? `request interrupted (${result.detail})` : `HTTP ${result.status} (${result.detail || "no content-type"})`;
+      const retryAfter = Number(result.retryAfter);
+      await page.waitForTimeout(Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : 1_500 * attempt, 10_000)).catch(() => undefined);
+    }
+    throw new InfraError(`${path} kept failing: ${last}.`);
+  };
+  const readCart = () => cartApi("GET", "/cart.js");
   const clearCart = async () => {
-    await context.request.post(`${storeUrl}/cart/clear.js`, { failOnStatusCode: false });
+    await cartApi("POST", "/cart/clear.js");
   };
   const waitForCart = async (predicate: (cart: CartState) => boolean, failure: string) => {
     const deadline = Date.now() + 10_000;
@@ -97,12 +141,14 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
   const step = async <T>(index: number, action: () => Promise<T>): Promise<T> => {
     try {
       return await action();
-    } catch {
+    } catch (error) {
+      if (error instanceof InfraError) throw error;
       await page.waitForTimeout(1_000);
       try {
         return await action();
-      } catch (error) {
-        throw new StepFailure(index, firstLine(error));
+      } catch (retryError) {
+        if (retryError instanceof InfraError) throw retryError;
+        throw new StepFailure(index, firstLine(retryError));
       }
     }
   };
@@ -122,6 +168,7 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
 
     await step(2, async () => {
       const response = await page.goto(session.url(choice.product), { waitUntil: "domcontentloaded", timeout: 30_000 });
+      if (await isBotChallenge(page)) throw new InfraError("Shopify's bot protection challenged the automated browser on the product page.");
       if (!response || response.status() >= 400) throw new Error(`The product page returned HTTP ${response?.status() ?? "no response"}.`);
       await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
     });
@@ -131,7 +178,7 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
     const variantId = await ensureAvailableVariant(form, choice.available, outcome.notes);
 
     await step(3, async () => {
-      const button = options.selectors.addToCart ? page.locator(options.selectors.addToCart).first() : form.locator('[name="add"], button[type="submit"], input[type="submit"]').first();
+      const button = options.selectors.addToCart ? visible(page.locator(options.selectors.addToCart)) : await addToCartControl(page, form);
       await button.scrollIntoViewIfNeeded({ timeout: 5_000 });
       await button.click({ timeout: 10_000 });
       await waitForCart(
@@ -143,11 +190,11 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
 
     await step(4, async () => {
       await page.goto(session.url("/cart"), { waitUntil: "domcontentloaded", timeout: 30_000 });
-      const quantity = page.locator(options.selectors.quantity ?? 'input[name="updates[]"], input[name^="updates["]').first();
+      const quantity = visible(page.locator(options.selectors.quantity ?? 'input[name="updates[]"], input[name^="updates["]'));
       if ((await quantity.count()) === 0) throw new Error("No quantity input was found on /cart.");
       await quantity.fill("2");
       await quantity.dispatchEvent("change");
-      const update = page.locator(options.selectors.update ?? '[name="update"]').first();
+      const update = visible(page.locator(options.selectors.update ?? '[name="update"]'));
       if ((await update.count()) > 0 && (await update.isVisible())) await update.click({ timeout: 10_000 });
       await waitForCart(
         (cart) => cart.items.find((item) => item.variant_id === addedVariant)?.quantity === 2,
@@ -161,7 +208,7 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
 
     await step(5, async () => {
       if (!new URL(page.url()).pathname.startsWith("/cart")) await page.goto(session.url("/cart"), { waitUntil: "domcontentloaded", timeout: 30_000 });
-      const checkout = page.locator(options.selectors.checkout ?? '[name="checkout"], a[href*="/checkout"]').first();
+      const checkout = visible(page.locator(options.selectors.checkout ?? '[name="checkout"], a[href*="/checkout"]'));
       await checkout.click({ timeout: 10_000 });
       await page.waitForURL((url) => /\/checkouts?(?:\/|$)/.test(url.pathname) || url.hostname.endsWith("checkout.shopify.com"), {
         timeout: 25_000,
@@ -175,6 +222,9 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
     });
     return outcome;
   } catch (error) {
+    if (error instanceof InfraError) {
+      return { ...outcome, status: "error", category: "infra", message: `The purchase flow could not be verified: ${error.message}` };
+    }
     if (!(error instanceof StepFailure)) {
       return { ...outcome, status: "error", category: "internal", message: `The purchase flow stopped unexpectedly: ${firstLine(error)}` };
     }
@@ -200,22 +250,44 @@ export async function runPurchaseFlow(session: StoreSession, options: PurchaseOp
 async function chooseProduct(session: StoreSession, products: readonly string[]): Promise<{ product: string; available: number[] } | undefined> {
   for (const product of products) {
     const pathname = new URL(product, session.options.storeUrl).pathname.replace(/\/+$/, "");
-    try {
-      const response = await session.context.request.get(`${session.options.storeUrl}${pathname}.js`, { failOnStatusCode: false, timeout: 15_000 });
-      if (!response.ok()) continue;
-      const json = (await response.json()) as ProductJson;
-      const available = (json.variants ?? []).filter((variant) => variant.available).map((variant) => variant.id);
-      if (available.length > 0) return { product, available };
-    } catch {
-      continue;
+    for (let attempt = 1; ; attempt += 1) {
+      const response = await session.context.request.get(`${session.options.storeUrl}${pathname}.js`, { failOnStatusCode: false, timeout: 15_000 }).catch(() => undefined);
+      // A throttled request says nothing about stock; never mistake it for "no product available".
+      if (response?.status() === 429) {
+        if (attempt >= 4) throw new InfraError(`${pathname}.js kept returning HTTP 429 (Shopify rate limit).`);
+        await new Promise((resolve) => setTimeout(resolve, 2_000 * attempt));
+        continue;
+      }
+      if (response?.ok()) {
+        const json = (await response.json().catch(() => ({}))) as ProductJson;
+        const available = (json.variants ?? []).filter((variant) => variant.available).map((variant) => variant.id);
+        if (available.length > 0) return { product, available };
+      }
+      break;
     }
   }
   return undefined;
 }
 
+/**
+ * The product form is the /cart/add form that has an add-to-cart control. Themes such as Dawn
+ * render other /cart/add forms first (Shop Pay installments) that have no button.
+ */
 async function productForm(page: Page): Promise<Locator> {
+  for (const scope of ['main form[action*="/cart/add"]', 'form[action*="/cart/add"]']) {
+    const withControl = page.locator(`${scope}:has(${ADD_CONTROL})`);
+    if ((await withControl.count()) > 0) return withControl.first();
+  }
   const inMain = page.locator('main form[action*="/cart/add"]');
   return (await inMain.count()) > 0 ? inMain.first() : page.locator('form[action*="/cart/add"]').first();
+}
+
+/** The add-to-cart control inside the form, or one linked to it with the form="id" attribute. */
+async function addToCartControl(page: Page, form: Locator): Promise<Locator> {
+  const inside = form.locator(ADD_CONTROL);
+  if ((await inside.count()) > 0) return visible(inside);
+  const id = await form.getAttribute("id").catch(() => null);
+  return id ? visible(page.locator(`[form="${id}"]:is(${ADD_CONTROL})`)) : visible(inside);
 }
 
 /** Returns the selected variant ID, switching to an available one when the default is sold out. */

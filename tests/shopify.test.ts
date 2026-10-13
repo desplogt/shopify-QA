@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { StageError } from "../src/errors.js";
-import { classifyCliFailure, parseThemeCheck, ShopifyCli, type CommandRunner, type RemoteTheme } from "../src/shopify/cli.js";
+import { classifyCliFailure, parseJson, parseThemeCheck, ShopifyCli, type CommandRunner, type RemoteTheme } from "../src/shopify/cli.js";
 import { deleteQaTheme, isQaTheme, prepareQaTheme, qaThemeName } from "../src/shopify/qa-theme.js";
 
 /** Records CLI calls and answers `theme list`, `push`, and `delete` from an in-memory store. */
@@ -113,6 +113,11 @@ test("retries transient Shopify failures before giving up", async () => {
   const cli = new ShopifyCli({ store: "shop.test", themeToken: "x", runner });
   assert.deepEqual(await cli.listThemes(), []);
   assert.equal(attempts, 2);
+});
+
+test("tolerates warnings before and upgrade notices after the CLI's JSON", () => {
+  const stdout = 'Warning: something\n[\n  { "id": 1, "name": "Dawn", "role": "live" }\n]\n💡 Version 4.9.3 available! Run `brew upgrade shopify-cli`\n';
+  assert.deepEqual(parseJson(stdout, "theme list"), [{ id: 1, name: "Dawn", role: "live" }]);
 });
 
 test("parses Theme Check JSON into theme-relative files and 1-based lines", () => {
