@@ -1,0 +1,7 @@
+node_modules/
+dist/
+theme-qa-report/
+test-results/
+*.log
+.env
+.DS_Store

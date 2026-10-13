@@ -1,0 +1,46 @@
+# Copy to the root of a theme repository as theme-qa.yml.
+# Full reference: docs/PROCESS.md, section 7.
+
+store: example-store.myshopify.com
+
+# Command to run before uploading, for themes with a build step (Vite, webpack...).
+build: null
+
+# Folder that contains layout/, sections/, snippets/, templates/...
+themeRoot: .
+
+# One page per template type is usually enough (max 10).
+pages:
+  - /
+  - /collections/all
+  - /products/example
+  - /cart
+
+purchase:
+  # The first product with an available variant is used.
+  products:
+    - /products/example
+    - /products/backup-example
+  # Only needed when the theme does not follow Dawn's markup.
+  selectors: {}
+  #   addToCart: "product-form button[type=submit]"
+  #   quantity: "cart-items input.quantity__input"
+  #   update: "[name=update]"
+  #   checkout: "#checkout"
+
+viewports: [desktop, mobile]
+
+# Substrings of third-party hosts to block (analytics, chat widgets, popups).
+block:
+  - googletagmanager
+  - connect.facebook.net
+  - klaviyo
+
+# Exceptions for known false positives. Every entry needs a reason.
+ignore: []
+#  - rule: console-error
+#    match: "Reviews widget failed"
+#    reason: "Third-party reviews widget, tracked in TICKET-123"
+
+themeCheck:
+  enabled: true

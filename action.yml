@@ -1,0 +1,69 @@
+name: Theme QA
+description: Release gate for Shopify themes. Compares the pull request's theme with the live theme and blocks new storefront defects.
+
+inputs:
+  mode:
+    description: "check (run the gate) or cleanup (delete the QA theme of a closed pull request)"
+    default: check
+  config:
+    description: Path to theme-qa.yml, relative to the repository root
+    default: theme-qa.yml
+  theme-token:
+    description: Theme Access password for the store
+    required: true
+  storefront-password:
+    description: Storefront password, only when the store is password protected
+    default: ""
+  github-token:
+    description: Token used to read pull request state and post the report comment
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Install Theme QA
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        npm ci --no-audit --no-fund
+        npm run build
+        if [ "$MODE" = "check" ]; then
+          npx playwright install --with-deps chromium-headless-shell
+        fi
+
+    - name: Install Shopify CLI
+      shell: bash
+      run: npm install --global @shopify/cli@3 --no-audit --no-fund
+
+    - name: Run Theme QA
+      shell: bash
+      env:
+        SHOPIFY_CLI_THEME_TOKEN: ${{ inputs.theme-token }}
+        STOREFRONT_PASSWORD: ${{ inputs.storefront-password }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        MODE: ${{ inputs.mode }}
+        CONFIG: ${{ inputs.config }}
+        CLI: ${{ github.action_path }}/dist/cli.js
+      # Inputs are passed through the environment, never interpolated into the script.
+      run: |
+        if [ "$MODE" = "cleanup" ]; then
+          node "$CLI" cleanup --config "$CONFIG"
+        else
+          # The pull request merge commit's first parent is the tip of the target branch.
+          node "$CLI" check --config "$CONFIG" --base HEAD^1 --comment
+        fi
+
+    - name: Upload report
+      if: always() && inputs.mode == 'check'
+      uses: actions/upload-artifact@v4
+      with:
+        name: theme-qa-report
+        path: theme-qa-report
+        retention-days: 14
+        if-no-files-found: ignore

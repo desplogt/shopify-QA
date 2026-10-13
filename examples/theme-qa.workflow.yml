@@ -1,0 +1,50 @@
+# Copy to .github/workflows/theme-qa.yml in a theme repository.
+# Then require the "Theme QA / check" status in the branch protection rule for main.
+name: Theme QA
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+
+concurrency:
+  # A new commit cancels the run in progress for the same pull request.
+  group: theme-qa-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    if: github.event.action != 'closed' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The default ref is the pull request merge commit: the branch plus the latest main,
+      # including theme editor auto-saves. fetch-depth 2 makes HEAD^1 (main) available.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # Replace with the location of the Theme QA repository.
+      - uses: sthreeone/theme-qa@v1
+        with:
+          theme-token: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
+          storefront-password: ${{ secrets.STOREFRONT_PASSWORD }}
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          sparse-checkout: theme-qa.yml
+          sparse-checkout-cone-mode: false
+
+      - uses: sthreeone/theme-qa@v1
+        with:
+          mode: cleanup
+          theme-token: ${{ secrets.SHOPIFY_CLI_THEME_TOKEN }}
